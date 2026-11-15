@@ -142,7 +142,7 @@ fn take_staged(
     stage: &StageAJob,
     id: usize,
 ) -> Option<Result<super::mt::DecodedSegment, FrameDecoderError>> {
-    let mut guard = stage.slots[id].lock().unwrap();
+    let mut guard = stage.slots[id].0.lock().unwrap();
     loop {
         if let Some(staged) = guard.take() {
             return Some(staged);
@@ -150,7 +150,7 @@ fn take_staged(
         if poisoned_or_aborted(stage) {
             return None;
         }
-        guard = stage.ready.wait(guard).unwrap();
+        guard = stage.slots[id].1.wait(guard).unwrap();
     }
 }
 
@@ -186,7 +186,7 @@ fn run_lane(lane: &LaneJob) {
             // (the same pattern the staging backpressure uses).
             let guard = stage.poison.lock().unwrap();
             let (_guard, _timeout) = stage
-                .ready
+                .progress
                 .wait_timeout(guard, core::time::Duration::from_millis(50))
                 .unwrap();
         }
@@ -294,7 +294,7 @@ fn run_lane(lane: &LaneJob) {
         // The executed range is final from here on; let backpressured
         // staging advance.
         stage.consumed_count.fetch_add(1, Ordering::Release);
-        stage.ready.notify_all();
+        stage.progress.notify_all();
     }
     // Close the last frame's checksum.
     #[cfg(feature = "hash")]
@@ -319,7 +319,10 @@ pub(super) fn serve_frame_lane(lane: &Arc<LaneJob>) -> bool {
         Err(payload) => {
             *lane.stage.poison.lock().unwrap() = Some(payload);
             record(lane, LaneOutcome::Aborted);
-            lane.stage.ready.notify_all();
+            lane.stage.progress.notify_all();
+            for (_, filled) in &lane.stage.slots {
+                filled.notify_all();
+            }
             true
         },
     }
@@ -365,7 +368,7 @@ impl Place<'_> {
                         }
                         let guard = stage.poison.lock().unwrap();
                         let (_guard, _timeout) = stage
-                            .ready
+                            .progress
                             .wait_timeout(guard, core::time::Duration::from_millis(50))
                             .unwrap();
                     }
