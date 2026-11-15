@@ -1426,6 +1426,12 @@ pub(super) fn verify_frame_content_sizes(
 /// borrows: a worker touches them only while serving the lease, and
 /// `decode_parallel` waits every lease out before returning, so the
 /// borrows outlive the freeze (the encoder-side `FrozenSrc` contract).
+/// One segment's staged result and the condvar paired with its mutex: the
+/// ordered consumer (and each frame lane) drains slot `i` by waiting on
+/// `slots[i].1` under `slots[i].0` — a condvar may never be waited on
+/// under two mutexes, so every slot carries its own.
+type StagedSlot = (Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>, Condvar);
+
 pub(super) struct StageAJob {
     input: *const [u8],
     segments: *const [SegmentPlan],
@@ -1433,8 +1439,11 @@ pub(super) struct StageAJob {
     /// Leased worker count: the staging backpressure bound, so staging
     /// memory stays proportional to the worker count, not the input.
     threads: usize,
-    pub(super) slots: Vec<Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>>,
-    pub(super) ready: Condvar,
+    pub(super) slots: Vec<StagedSlot>,
+    /// Staging-progress condvar, paired only with `poison`: the staging
+    /// backpressure sleep and the lane base polls use it as their bounded
+    /// sleep token.
+    pub(super) progress: Condvar,
     next_job: AtomicUsize,
     consumed: AtomicUsize,
     /// Executed-segment count (any lane), the lane mode's backpressure
@@ -1469,8 +1478,10 @@ impl StageAJob {
             segments,
             n_segments: segments.len(),
             threads,
-            slots: (0..segments.len()).map(|_| Mutex::new(None)).collect(),
-            ready: Condvar::new(),
+            slots: (0..segments.len())
+                .map(|_| (Mutex::new(None), Condvar::new()))
+                .collect(),
+            progress: Condvar::new(),
             next_job: AtomicUsize::new(0),
             consumed: AtomicUsize::new(0),
             consumed_count: AtomicUsize::new(0),
@@ -1537,7 +1548,7 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
             }
             let guard = job.poison.lock().unwrap();
             let (_guard, _timeout) = job
-                .ready
+                .progress
                 .wait_timeout(guard, core::time::Duration::from_millis(50))
                 .unwrap();
         }
@@ -1571,22 +1582,33 @@ pub(super) fn serve_stagea(job: &StageAJob, scratch: &mut Option<SegmentScratch>
                     };
                     job.seg_sizes[id].store(published, Ordering::Release);
                 }
-                *job.slots[id].lock().unwrap() = Some(res);
+                *job.slots[id].0.lock().unwrap() = Some(res);
             },
             Err(payload) => {
                 *job.poison.lock().unwrap() = Some(payload);
                 // Release the slot so the ordered consumer can run to
                 // completion; this error is never observed (resume_unwind
                 // replaces it after the leases are waited out).
-                *job.slots[id].lock().unwrap() = Some(Err(FrameDecoderError::NotYetInitialized));
+                *job.slots[id].0.lock().unwrap() = Some(Err(FrameDecoderError::NotYetInitialized));
                 // The scratch may be mid-decode garbage: drop it rather
                 // than reuse, and retire this thread (never reuse a thread
                 // that has seen an unwind).
                 *scratch = None;
                 retire = true;
+                // Poison parks every remaining worker at the loop-top
+                // check, so slots claimed later never fill: wake all slot
+                // waiters (the lanes re-check `poisoned_or_aborted`) and
+                // the progress sleepers instead of only this slot's.
+                for (_, filled) in &job.slots {
+                    filled.notify_all();
+                }
+                job.progress.notify_all();
             },
         }
-        job.ready.notify_all();
+        // The filled slot wakes its own waiter; the seg_sizes publish
+        // (lane mode) wakes the lane base polls parked on `progress`.
+        job.slots[id].1.notify_all();
+        job.progress.notify_all();
         if retire {
             return true;
         }
@@ -1608,7 +1630,12 @@ pub(super) struct LeaseOut<'a> {
 impl Drop for LeaseOut<'_> {
     fn drop(&mut self) {
         self.job.abort.store(true, Ordering::Release);
-        self.job.ready.notify_all();
+        // Abort wakes every park site: the `progress` sleep and each slot
+        // waiter re-check their predicates and retire.
+        self.job.progress.notify_all();
+        for (_, filled) in &self.job.slots {
+            filled.notify_all();
+        }
         for (slot, lease) in self.slots {
             super::mt_pool::wait_leave(slot, lease);
         }
@@ -1636,8 +1663,10 @@ fn decode_parallel(
         segments,
         n_segments,
         threads,
-        slots: (0..n_segments).map(|_| Mutex::new(None)).collect(),
-        ready: Condvar::new(),
+        slots: (0..n_segments)
+            .map(|_| (Mutex::new(None), Condvar::new()))
+            .collect(),
+        progress: Condvar::new(),
         next_job: AtomicUsize::new(0),
         consumed: AtomicUsize::new(0),
         consumed_count: AtomicUsize::new(0),
@@ -1664,9 +1693,9 @@ fn decode_parallel(
         let mut frame_base = 0usize;
         for (id, seg_plan) in segments.iter().enumerate() {
             let staged = {
-                let mut guard = job.slots[id].lock().unwrap();
+                let mut guard = job.slots[id].0.lock().unwrap();
                 while guard.is_none() {
-                    guard = job.ready.wait(guard).unwrap();
+                    guard = job.slots[id].1.wait(guard).unwrap();
                 }
                 guard.take().unwrap()
             };
@@ -1692,7 +1721,7 @@ fn decode_parallel(
             #[cfg(feature = "hash")]
             after_segment(region.base().cast_const(), seg_out_start..written);
             job.consumed.store(id + 1, Ordering::Release);
-            job.ready.notify_all();
+            job.progress.notify_all();
         }
         verify_frame_content_sizes(frame_pledges, &frame_starts, written)?;
         Ok(written)

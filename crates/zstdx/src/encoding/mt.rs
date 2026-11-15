@@ -367,7 +367,7 @@ pub fn compress_slice_mt(
     .serialize(&mut output);
 
     let slots: Vec<Mutex<Option<Vec<u8>>>> = (0..n_jobs).map(|_| Mutex::new(None)).collect();
-    let ready = Condvar::new();
+    let groups = WakeGroups::new(n_jobs);
     let next_job = AtomicUsize::new(0);
     let poison: Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>> = Mutex::new(None);
 
@@ -386,9 +386,9 @@ pub fn compress_slice_mt(
         // strictly sequential in input order, so a job's wait ends as soon
         // as the pass crosses its end.
         if let Some(gate) = &feed_gate {
-            let ready = &ready;
+            let groups = &groups;
             let poison = &poison;
-            scope.spawn(|| run_ldm_feed(src, gate, ready, poison));
+            scope.spawn(|| run_ldm_feed(src, gate, groups, poison));
         }
         for _ in 0..threads {
             scope.spawn(|| {
@@ -418,7 +418,7 @@ pub fn compress_slice_mt(
                     // one lands is pure scheduling).
                     let snapshot = if let Some(gate) = &feed_gate {
                         if let Some(span) =
-                            take_feed_span(gate, &ready, start as u64, end as u64, overlap as u64)
+                            take_feed_span(gate, &groups, start as u64, end as u64, overlap as u64)
                         {
                             JobSpfOwned::Feed {
                                 span,
@@ -429,7 +429,7 @@ pub fn compress_slice_mt(
                             // the ordered assembly drains before the
                             // panic resumes below.
                             *slots[id].lock().unwrap() = Some(Vec::new());
-                            ready.notify_all();
+                            groups.notify_all();
                             break;
                         }
                     } else if deep_ldm.is_some() {
@@ -446,7 +446,7 @@ pub fn compress_slice_mt(
                             Some(plan) if start as u64 > plan_med(plan) => match plan {
                                 PrefixPlan::Whole { med: _, share } => {
                                     if let Some((upto, snap)) =
-                                        wait_prefix_build(share, &ready, &poison)
+                                        wait_prefix_build(share, &groups, &poison)
                                     {
                                         JobSpfOwned::Whole((start as u64 > upto).then_some(snap))
                                     } else {
@@ -454,16 +454,16 @@ pub fn compress_slice_mt(
                                         // slot so the ordered assembly drains
                                         // before the panic resumes.
                                         *slots[id].lock().unwrap() = Some(Vec::new());
-                                        ready.notify_all();
+                                        groups.notify_all();
                                         break;
                                     }
                                 },
                                 PrefixPlan::Windowed(w) => {
-                                    match wait_ldm_snapshot(w, &ready, &poison, start as u64) {
+                                    match wait_ldm_snapshot(w, &groups, &poison, start as u64) {
                                         Some(snap) => JobSpfOwned::Windowed(Some(snap)),
                                         None if poison.lock().unwrap().is_some() => {
                                             *slots[id].lock().unwrap() = Some(Vec::new());
-                                            ready.notify_all();
+                                            groups.notify_all();
                                             break;
                                         },
                                         // The build ended without a usable
@@ -539,15 +539,21 @@ pub fn compress_slice_mt(
                     match attempt {
                         Ok(bytes) => {
                             *slots[id].lock().unwrap() = Some(bytes);
+                            // Only the ordered assembly waits on job
+                            // completion, on the filled slot's own condvar.
+                            groups.slots[id].notify_all();
                         },
                         Err(payload) => {
                             *poison.lock().unwrap() = Some(payload);
                             // Release the slot so the ordered assembly below can
                             // run to completion before the panic is resumed.
                             *slots[id].lock().unwrap() = Some(Vec::new());
+                            // Poison changes every waiter's predicate: sweep
+                            // every group (feed/prefix/window waiters, the
+                            // assembly on any slot).
+                            groups.notify_all();
                         },
                     }
-                    ready.notify_all();
                 }
             });
         }
@@ -575,11 +581,14 @@ pub fn compress_slice_mt(
                 // bounded wherever the build has reached when the job's
                 // worker picks it up.
                 PrefixPlan::Windowed(w) => {
-                    build_ldm_prefix_chain(src, level, shape, w, &ready, ldm_mode);
+                    build_ldm_prefix_chain(src, level, shape, w, &groups, ldm_mode);
                 },
                 PrefixPlan::SelfFill { .. } => {},
             }
-            ready.notify_all();
+            // The build's publish (either plan's share) lands in the
+            // matching dedicated condvar.
+            groups.whole.notify_all();
+            groups.window.notify_all();
             #[cfg(feature = "job_trace")]
             super::job_trace::add_spf_build(trace_spf);
         }
@@ -593,7 +602,7 @@ pub fn compress_slice_mt(
 
         // Ordered assembly on the calling thread: each job's blocks append as
         // soon as they land.
-        for slot in &slots {
+        for (slot, slot_ready) in slots.iter().zip(&groups.slots) {
             let mut guard = slot.lock().unwrap();
             while guard.is_none() {
                 // A poisoned pool retires its workers with jobs unclaimed —
@@ -605,7 +614,7 @@ pub fn compress_slice_mt(
                     *guard = Some(Vec::new());
                     break;
                 }
-                guard = ready.wait(guard).unwrap();
+                guard = slot_ready.wait(guard).unwrap();
             }
             let bytes = guard.take().unwrap();
             output.extend_from_slice(&bytes);
@@ -1272,6 +1281,46 @@ impl JobSpfOwned {
     }
 }
 
+/// The bulk encode's park sites: std forbids waiting on one condvar under
+/// two mutexes, so the ordered assembly's slot drains, the LDM feed gate,
+/// the whole-prefix share and the windowed share each get a dedicated
+/// condvar. Error paths (a poisoned pool or feed) sweep every group via
+/// `notify_all` — cold paths, and a no-waiter notify is cheap.
+struct WakeGroups {
+    /// One per job slot, paired with `slots[i]`: the ordered assembly
+    /// drains slot i on `slots[i]`'s own condvar.
+    slots: Vec<Condvar>,
+    /// Paired with the LDM feed gate's mutex.
+    feed: Condvar,
+    /// Paired with the whole-prefix share's mutex.
+    whole: Condvar,
+    /// Paired with the windowed share's mutex.
+    window: Condvar,
+}
+
+impl WakeGroups {
+    fn new(n_slots: usize) -> Self {
+        Self {
+            slots: (0..n_slots).map(|_| Condvar::new()).collect(),
+            feed: Condvar::new(),
+            whole: Condvar::new(),
+            window: Condvar::new(),
+        }
+    }
+
+    /// Wake every group: poison or a panicked feed changes every waiter's
+    /// predicate, and the sweeper cannot know which slot the assembly is
+    /// parked on.
+    fn notify_all(&self) {
+        for slot in &self.slots {
+            slot.notify_all();
+        }
+        self.feed.notify_all();
+        self.whole.notify_all();
+        self.window.notify_all();
+    }
+}
+
 /// The serial LDM feed's publication state (the opt rows' far class): one
 /// frame-continuous generation appends far sequences in split order while
 /// `published` advances per block chunk, so a job's span is final once
@@ -1302,7 +1351,7 @@ static FEED_PANIC_INPUT: core::sync::atomic::AtomicPtr<u8> =
 fn run_ldm_feed(
     src: &[u8],
     gate: &Mutex<LdmFeedGate>,
-    ready: &Condvar,
+    groups: &WakeGroups,
     poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
 ) {
     #[cfg(feature = "job_trace")]
@@ -1329,7 +1378,7 @@ fn run_ldm_feed(
             g.seqs.extend_from_slice(&chunk);
             g.published = end as u64;
             drop(g);
-            ready.notify_all();
+            groups.feed.notify_all();
             pos = end;
         }
     }));
@@ -1342,7 +1391,9 @@ fn run_ldm_feed(
             *p = result.err();
         }
         gate.lock().unwrap().panicked = true;
-        ready.notify_all();
+        // The panicked flag is the feed waiters' predicate, and the poison
+        // is every other group's: sweep them all.
+        groups.notify_all();
     }
 }
 
@@ -1353,7 +1404,7 @@ fn run_ldm_feed(
 /// panicked.
 fn take_feed_span(
     gate: &Mutex<LdmFeedGate>,
-    ready: &Condvar,
+    groups: &WakeGroups,
     start: u64,
     end: u64,
     reach: u64,
@@ -1363,7 +1414,7 @@ fn take_feed_span(
         if g.panicked {
             return None;
         }
-        g = ready.wait(g).unwrap();
+        g = groups.feed.wait(g).unwrap();
     }
     let lo = g.seqs.partition_point(|s| s.split < start);
     let hi = g.seqs.partition_point(|s| s.split < end);
@@ -1844,13 +1895,12 @@ fn build_prefix_snapshot(
 }
 
 /// Block until the calling thread publishes the shared prefix fill's
-/// build (or a poisoned pool aborts the wait). Re-checks on every wake:
-/// the build publishes through the shared `ready` condvar the job
-/// completions already use. Lock order share→poison is one-sided, like
+/// build (or a poisoned pool aborts the wait). Re-checks on every wake.
+/// Lock order share→poison is one-sided, like
 /// the assembly's slot→poison.
 fn wait_prefix_build(
     share: &Arc<Mutex<Option<PrefixBuild>>>,
-    ready: &Condvar,
+    groups: &WakeGroups,
     poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
 ) -> Option<(u64, Arc<StripSnapshot>)> {
     let mut guard = share.lock().unwrap();
@@ -1861,7 +1911,7 @@ fn wait_prefix_build(
         if poison.lock().unwrap().is_some() {
             return None;
         }
-        guard = ready.wait(guard).unwrap();
+        guard = groups.whole.wait(guard).unwrap();
     }
 }
 
@@ -1874,7 +1924,7 @@ fn wait_prefix_build(
 /// prefix from zero, byte-equal to an adoption) or the pool is poisoned.
 fn wait_ldm_snapshot(
     plan: &WindowPlan,
-    ready: &Condvar,
+    groups: &WakeGroups,
     poison: &Mutex<Option<alloc::boxed::Box<dyn std::any::Any + Send>>>,
     start: u64,
 ) -> Option<Arc<LdmPrefixSnapshot>> {
@@ -1886,7 +1936,7 @@ fn wait_ldm_snapshot(
         if guard.done || poison.lock().unwrap().is_some() {
             return None;
         }
-        guard = ready.wait(guard).unwrap();
+        guard = groups.window.wait(guard).unwrap();
     }
 }
 
@@ -1894,13 +1944,13 @@ fn wait_ldm_snapshot(
 /// prefix through `stop`, segmented at batch-freeze points, publishing a
 /// snapshot whenever the fill crosses the next cadence target (and at
 /// `med`, the first target, which every adopter can use). Publishing
-/// wakes the waiting adopters through the shared `ready` condvar.
+/// wakes the waiting adopters through the window group's condvar.
 fn build_ldm_prefix_chain(
     src: &[u8],
     level: Level,
     shape: crate::InputShape,
     plan: &WindowPlan,
-    ready: &Condvar,
+    groups: &WakeGroups,
     ldm_mode: crate::LdmMode,
 ) {
     let mut state = take_slice_state(
@@ -1937,10 +1987,12 @@ fn build_ldm_prefix_chain(
             let snap = Arc::new(state.matcher.ldm_snapshot(upto));
             plan.share.lock().unwrap().publishes.push(snap);
             next_pub = upto + plan.cadence;
-            ready.notify_all();
+            groups.window.notify_all();
         }
     }
     plan.share.lock().unwrap().done = true;
+    // The caller's post-build sweep (`whole`/`window`) wakes adopters that
+    // parked on `done` alone.
     return_slice_state(state);
 }
 
