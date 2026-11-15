@@ -19,6 +19,9 @@ use core::{
     slice,
 };
 
+#[cfg(target_os = "linux")]
+use core::sync::atomic::{AtomicUsize, Ordering};
+
 /// Minimum byte size that takes the hugepage path: below it a table is
 /// L2/L3-resident and page-dispersity recovery does not pay.
 pub(crate) const HUGE_MIN_BYTES: usize = 8 << 20;
