@@ -1430,7 +1430,10 @@ pub(super) fn verify_frame_content_sizes(
 /// ordered consumer (and each frame lane) drains slot `i` by waiting on
 /// `slots[i].1` under `slots[i].0` — a condvar may never be waited on
 /// under two mutexes, so every slot carries its own.
-type StagedSlot = (Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>, Condvar);
+type StagedSlot = (
+    Mutex<Option<Result<DecodedSegment, FrameDecoderError>>>,
+    Condvar,
+);
 
 pub(super) struct StageAJob {
     input: *const [u8],
