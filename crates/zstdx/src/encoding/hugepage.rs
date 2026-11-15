@@ -17,7 +17,6 @@ use core::{
     ops::{Deref, DerefMut},
     ptr::{self, NonNull},
     slice,
-    sync::atomic::{AtomicUsize, Ordering},
 };
 
 /// Minimum byte size that takes the hugepage path: below it a table is
